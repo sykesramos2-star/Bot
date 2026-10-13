@@ -1,0 +1,952 @@
+#!/usr/bin/env python3
+"""
+ZeroTrace — Security + Pesos Economy + Carl-style Logging (Pure Slash)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import random
+import time
+from collections import deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Deque, Dict, Optional, Set
+
+import discord
+from discord import app_commands, ui
+from discord.ext import commands, tasks
+
+TOKEN = os.getenv("DISCORD_TOKEN", "MTU1MTkwMjc4OTQyNzI2OTY3Mw.GItN35.Lg8MMA2WpeTxd9NAJztzNXSEZNh_lV-EPUGZdw")
+DATA_FILE = Path("zerotrace_data.json")
+
+DEFAULTS = {
+    "join_threshold": 8,
+    "join_window": 10,
+    "ban_threshold": 5,
+    "ban_window": 15,
+    "channel_delete_threshold": 3,
+    "role_delete_threshold": 3,
+    "kick_threshold": 6,
+    "kick_window": 15,
+    "verification_enabled": False,
+    "log_channel_id": None,
+    "quarantine_role_id": None,
+    "verified_role_id": None,
+}
+
+START_CASH = 2500
+DAILY_MIN, DAILY_MAX = 800, 2200
+WORK_MIN, WORK_MAX = 350, 1200
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
+log = logging.getLogger("zerotrace")
+
+# ──────────────────────────────────────────────────────────────
+class GuildData:
+    def __init__(self, guild_id: int) -> None:
+        self.guild_id = guild_id
+        self.config: Dict[str, Any] = DEFAULTS.copy()
+        self.whitelist: Set[int] = set()
+        self.trusted_roles: Set[int] = set()
+        self.punished: Dict[int, float] = {}
+        self.join_times: Deque[float] = deque()
+        self.ban_times: Deque[float] = deque()
+        self.kick_times: Deque[float] = deque()
+        self.channel_deletes: Deque[float] = deque()
+        self.role_deletes: Deque[float] = deque()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "config": self.config,
+            "whitelist": list(self.whitelist),
+            "trusted_roles": list(self.trusted_roles),
+            "punished": self.punished,
+        }
+
+    @classmethod
+    def from_dict(cls, guild_id: int, data: Dict[str, Any]) -> "GuildData":
+        g = cls(guild_id)
+        g.config.update(data.get("config", {}))
+        g.whitelist = set(data.get("whitelist", []))
+        g.trusted_roles = set(data.get("trusted_roles", []))
+        g.punished = {int(k): float(v) for k, v in data.get("punished", {}).items()}
+        return g
+
+
+class UserEconomy:
+    def __init__(self) -> None:
+        self.cash: int = START_CASH
+        self.bank: int = 0
+        self.daily_claimed: float = 0.0
+        self.work_claimed: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "cash": self.cash,
+            "bank": self.bank,
+            "daily_claimed": self.daily_claimed,
+            "work_claimed": self.work_claimed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "UserEconomy":
+        u = cls()
+        u.cash = int(data.get("cash", START_CASH))
+        u.bank = int(data.get("bank", 0))
+        u.daily_claimed = float(data.get("daily_claimed", 0))
+        u.work_claimed = float(data.get("work_claimed", 0))
+        return u
+
+
+class DataStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.guilds: Dict[int, GuildData] = {}
+        self.economy: Dict[int, UserEconomy] = {}
+        self._load()
+
+    def _load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            for gid, gdata in raw.get("guilds", {}).items():
+                self.guilds[int(gid)] = GuildData.from_dict(int(gid), gdata)
+            for uid, edata in raw.get("economy", {}).items():
+                self.economy[int(uid)] = UserEconomy.from_dict(edata)
+        except Exception as e:
+            log.error("Load failed: %s", e)
+
+    def save(self) -> None:
+        try:
+            payload = {
+                "guilds": {str(k): v.to_dict() for k, v in self.guilds.items()},
+                "economy": {str(k): v.to_dict() for k, v in self.economy.items()},
+            }
+            self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:
+            log.error("Save failed: %s", e)
+
+    def get_guild(self, guild_id: int) -> GuildData:
+        if guild_id not in self.guilds:
+            self.guilds[guild_id] = GuildData(guild_id)
+        return self.guilds[guild_id]
+
+    def get_user(self, user_id: int) -> UserEconomy:
+        if user_id not in self.economy:
+            self.economy[user_id] = UserEconomy()
+        return self.economy[user_id]
+
+
+store = DataStore(DATA_FILE)
+
+# ──────────────────────────────────────────────────────────────
+intents = discord.Intents.default()
+intents.members = True
+intents.guilds = True
+intents.message_content = True
+intents.moderation = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
+tree = bot.tree
+
+
+def is_trusted(member: discord.Member, gdata: GuildData) -> bool:
+    if member.id in gdata.whitelist or member.guild_permissions.administrator:
+        return True
+    return any(r.id in gdata.trusted_roles for r in member.roles)
+
+
+async def send_log(guild: discord.Guild, embed: discord.Embed) -> None:
+    """Carl-style log sender"""
+    gdata = store.get_guild(guild.id)
+    ch_id = gdata.config.get("log_channel_id")
+    if not ch_id:
+        return
+    channel = guild.get_channel(ch_id)
+    if isinstance(channel, discord.TextChannel):
+        try:
+            await channel.send(embed=embed)
+        except Exception:
+            pass
+
+
+async def punish(member: discord.Member, reason: str, duration: int = 3600) -> None:
+    gdata = store.get_guild(member.guild.id)
+    gdata.punished[member.id] = time.time() + duration
+    store.save()
+    try:
+        await member.timeout(discord.utils.utcnow() + discord.timedelta(seconds=duration), reason=reason)
+        action = f"Timed out ({duration // 60}m)"
+    except Exception:
+        try:
+            await member.kick(reason=reason)
+            action = "Kicked"
+        except Exception:
+            action = "Failed"
+    embed = discord.Embed(
+        title="🛡️ Security Action",
+        description=f"**User:** {member.mention} (`{member.id}`)\n**Action:** {action}\n**Reason:** {reason}",
+        color=0xFF4444,
+        timestamp=datetime.now(timezone.utc),
+    )
+    await send_log(member.guild, embed)
+
+
+# ──────────────────────────────────────────────────────────────
+# HELP
+# ──────────────────────────────────────────────────────────────
+CATEGORIES = {
+    "home": {
+        "title": "Introducing ZeroTrace — the most powerful next-gen security bot.",
+        "desc": "Use the dropdown below to explore all command categories.\nCurrency: **₱ pesos**",
+    },
+    "economy": {
+        "title": "🪙 Pesos Economy & Scatter",
+        "desc": (
+            "`/pesos` — Check balance\n"
+            "`/daily` `/work` `/deposit` `/withdraw` `/pay`\n"
+            "`/slots` `/coinflip` `/scatter`"
+        ),
+    },
+    "security": {
+        "title": "🛡️ Security",
+        "desc": (
+            "`/setup` `/setlog` `/setquarantine` `/setverified`\n"
+            "`/verification` `/config` `/status`"
+        ),
+    },
+    "moderation": {
+        "title": "🔨 Moderation",
+        "desc": (
+            "`/verify` `/whitelist` `/trustrole` `/untrustrole`\n"
+            "`/purge` `/slowmode`"
+        ),
+    },
+}
+
+
+class HelpSelect(ui.Select):
+    def __init__(self) -> None:
+        options = [
+            discord.SelectOption(label="Home", value="home", emoji="🏠"),
+            discord.SelectOption(label="Economy", value="economy", emoji="🪙"),
+            discord.SelectOption(label="Security", value="security", emoji="🛡️"),
+            discord.SelectOption(label="Moderation", value="moderation", emoji="🔨"),
+        ]
+        super().__init__(placeholder="Choose a category", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        cat = self.values[0]
+        data = CATEGORIES[cat]
+        embed = discord.Embed(title=data["title"], description=data["desc"], color=0x2B2D31)
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        if cat == "home":
+            embed.add_field(
+                name="\u200b",
+                value="[Invite Me](https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=8&scope=bot%20applications.commands) • [Support Server](https://discord.gg/NdjBB63C8)",
+                inline=False,
+            )
+        await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class HelpView(ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=180)
+        self.add_item(HelpSelect())
+
+    @ui.button(label="Home", style=discord.ButtonStyle.secondary, row=1)
+    async def home_btn(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        data = CATEGORIES["home"]
+        embed = discord.Embed(title=data["title"], description=data["desc"], color=0x2B2D31)
+        if bot.user:
+            embed.set_thumbnail(url=bot.user.display_avatar.url)
+        embed.add_field(
+            name="\u200b",
+            value="[Invite Me](https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=8&scope=bot%20applications.commands) • [Support Server](https://discord.gg/NdjBB63C8)",
+            inline=False,
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @ui.button(label="All Commands", style=discord.ButtonStyle.secondary, row=1)
+    async def all_btn(self, interaction: discord.Interaction, button: ui.Button) -> None:
+        embed = discord.Embed(
+            title="📋 All Commands",
+            description=(
+                "**Economy**\n`/pesos` `/daily` `/work` `/deposit` `/withdraw` `/pay` `/slots` `/coinflip` `/scatter`\n\n"
+                "**Security**\n`/setup` `/setlog` `/setquarantine` `/setverified` `/verification` `/config` `/status`\n\n"
+                "**Moderation**\n`/verify` `/whitelist` `/trustrole` `/untrustrole` `/purge` `/slowmode`"
+            ),
+            color=0x2B2D31,
+        )
+        await interaction.response.edit_message(embed=embed, view=self)
+
+
+# ──────────────────────────────────────────────────────────────
+# EVENTS + CARL-STYLE LOGGING
+# ──────────────────────────────────────────────────────────────
+@bot.event
+async def on_ready() -> None:
+    log.info("ZeroTrace online as %s", bot.user)
+    try:
+        synced = await tree.sync()
+        log.info("Synced %d slash commands", len(synced))
+    except Exception as e:
+        log.error("Sync failed: %s", e)
+    cleanup_task.start()
+
+
+@bot.event
+async def on_member_join(member: discord.Member) -> None:
+    # Carl-style join log
+    embed = discord.Embed(
+        title="📥 Member Joined",
+        color=0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="User", value=f"{member.mention} (`{member.id}`)", inline=False)
+    embed.add_field(name="Account Created", value=discord.utils.format_dt(member.created_at, "R"), inline=True)
+    embed.add_field(name="Member Count", value=str(member.guild.member_count), inline=True)
+    await send_log(member.guild, embed)
+
+    if member.bot:
+        return
+
+    gdata = store.get_guild(member.guild.id)
+    now = time.time()
+    while gdata.join_times and now - gdata.join_times[0] > gdata.config["join_window"]:
+        gdata.join_times.popleft()
+    gdata.join_times.append(now)
+
+    if len(gdata.join_times) >= gdata.config["join_threshold"]:
+        raid_embed = discord.Embed(
+            title="🚨 RAID DETECTED",
+            description=f"**{len(gdata.join_times)}** joins in {gdata.config['join_window']}s\nLatest: {member.mention}",
+            color=0xFF0000,
+            timestamp=datetime.now(timezone.utc),
+        )
+        await send_log(member.guild, raid_embed)
+        if q_id := gdata.config.get("quarantine_role_id"):
+            if role := member.guild.get_role(q_id):
+                try:
+                    await member.add_roles(role, reason="Raid quarantine")
+                except Exception:
+                    pass
+
+    if gdata.config.get("verification_enabled"):
+        if q_id := gdata.config.get("quarantine_role_id"):
+            if role := member.guild.get_role(q_id):
+                try:
+                    await member.add_roles(role, reason="Awaiting verification")
+                except Exception:
+                    pass
+
+
+@bot.event
+async def on_member_remove(member: discord.Member) -> None:
+    embed = discord.Embed(
+        title="📤 Member Left",
+        color=0xED4245,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=member.display_avatar.url)
+    embed.add_field(name="User", value=f"{member} (`{member.id}`)", inline=False)
+    roles = [r.mention for r in member.roles if r != member.guild.default_role]
+    if roles:
+        embed.add_field(name="Roles", value=" ".join(roles[:15]), inline=False)
+    embed.add_field(name="Member Count", value=str(member.guild.member_count), inline=True)
+    await send_log(member.guild, embed)
+
+    # Kick detection
+    await asyncio.sleep(1)
+    gdata = store.get_guild(member.guild.id)
+    now = time.time()
+    try:
+        async for entry in member.guild.audit_logs(action=discord.AuditLogAction.kick, limit=3):
+            if entry.target and entry.target.id == member.id and isinstance(entry.user, discord.Member):
+                while gdata.kick_times and now - gdata.kick_times[0] > gdata.config["kick_window"]:
+                    gdata.kick_times.popleft()
+                gdata.kick_times.append(now)
+
+                kick_embed = discord.Embed(
+                    title="👢 Member Kicked",
+                    color=0xFEE75C,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                kick_embed.add_field(name="User", value=f"{member} (`{member.id}`)")
+                kick_embed.add_field(name="Moderator", value=entry.user.mention)
+                kick_embed.add_field(name="Reason", value=entry.reason or "No reason", inline=False)
+                await send_log(member.guild, kick_embed)
+
+                if len(gdata.kick_times) >= gdata.config["kick_threshold"] and not is_trusted(entry.user, gdata):
+                    await punish(entry.user, f"Mass kick ({len(gdata.kick_times)})", 7200)
+                break
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_member_ban(guild: discord.Guild, user: discord.User) -> None:
+    gdata = store.get_guild(guild.id)
+    now = time.time()
+    while gdata.ban_times and now - gdata.ban_times[0] > gdata.config["ban_window"]:
+        gdata.ban_times.popleft()
+    gdata.ban_times.append(now)
+
+    embed = discord.Embed(
+        title="🔨 Member Banned",
+        color=0xED4245,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="User", value=f"{user} (`{user.id}`)", inline=False)
+
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.ban, limit=3):
+            if entry.target and entry.target.id == user.id:
+                embed.add_field(name="Moderator", value=entry.user.mention if entry.user else "Unknown")
+                embed.add_field(name="Reason", value=entry.reason or "No reason", inline=False)
+                if isinstance(entry.user, discord.Member) and not is_trusted(entry.user, gdata):
+                    if len(gdata.ban_times) >= gdata.config["ban_threshold"]:
+                        await punish(entry.user, f"Mass ban ({len(gdata.ban_times)})", 7200)
+                break
+    except Exception:
+        pass
+
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_member_unban(guild: discord.Guild, user: discord.User) -> None:
+    embed = discord.Embed(
+        title="🔓 Member Unbanned",
+        color=0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="User", value=f"{user} (`{user.id}`)", inline=False)
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.unban, limit=1):
+            if entry.target and entry.target.id == user.id:
+                embed.add_field(name="Moderator", value=entry.user.mention if entry.user else "Unknown")
+                break
+    except Exception:
+        pass
+    await send_log(guild, embed)
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member) -> None:
+    # Nickname change
+    if before.nick != after.nick:
+        embed = discord.Embed(
+            title="📝 Nickname Changed",
+            color=0x5865F2,
+            timestamp=datetime.now(timezone.utc),
+        )
+        embed.set_thumbnail(url=after.display_avatar.url)
+        embed.add_field(name="User", value=after.mention)
+        embed.add_field(name="Before", value=before.nick or before.name, inline=True)
+        embed.add_field(name="After", value=after.nick or after.name, inline=True)
+        await send_log(after.guild, embed)
+
+    # Role changes
+    if before.roles != after.roles:
+        added = [r for r in after.roles if r not in before.roles]
+        removed = [r for r in before.roles if r not in after.roles]
+        if added or removed:
+            embed = discord.Embed(
+                title="🎭 Roles Updated",
+                color=0x5865F2,
+                timestamp=datetime.now(timezone.utc),
+            )
+            embed.set_thumbnail(url=after.display_avatar.url)
+            embed.add_field(name="User", value=after.mention, inline=False)
+            if added:
+                embed.add_field(name="Added", value=" ".join(r.mention for r in added), inline=False)
+            if removed:
+                embed.add_field(name="Removed", value=" ".join(r.mention for r in removed), inline=False)
+            await send_log(after.guild, embed)
+
+
+@bot.event
+async def on_message_delete(message: discord.Message) -> None:
+    if message.author.bot or not message.guild:
+        return
+    embed = discord.Embed(
+        title="🗑️ Message Deleted",
+        color=0xED4245,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=message.author.display_avatar.url)
+    embed.add_field(name="Author", value=f"{message.author.mention} (`{message.author.id}`)", inline=False)
+    embed.add_field(name="Channel", value=message.channel.mention, inline=True)
+    content = message.content[:1000] if message.content else "*No text content*"
+    embed.add_field(name="Content", value=content, inline=False)
+    if message.attachments:
+        embed.add_field(name="Attachments", value="\n".join(a.filename for a in message.attachments), inline=False)
+    await send_log(message.guild, embed)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message) -> None:
+    if before.author.bot or not before.guild or before.content == after.content:
+        return
+    embed = discord.Embed(
+        title="✏️ Message Edited",
+        color=0xFEE75C,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.set_thumbnail(url=after.author.display_avatar.url)
+    embed.add_field(name="Author", value=after.author.mention, inline=False)
+    embed.add_field(name="Channel", value=after.channel.mention, inline=True)
+    embed.add_field(name="Before", value=before.content[:500] or "*empty*", inline=False)
+    embed.add_field(name="After", value=after.content[:500] or "*empty*", inline=False)
+    embed.add_field(name="Jump", value=f"[Click]({after.jump_url})", inline=False)
+    await send_log(after.guild, embed)
+
+
+@bot.event
+async def on_guild_channel_create(channel: discord.abc.GuildChannel) -> None:
+    embed = discord.Embed(
+        title="📁 Channel Created",
+        color=0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Channel", value=f"{channel.mention} (`{channel.id}`)")
+    embed.add_field(name="Type", value=str(channel.type).replace("ChannelType.", ""))
+    try:
+        async for entry in channel.guild.audit_logs(action=discord.AuditLogAction.channel_create, limit=1):
+            embed.add_field(name="Created by", value=entry.user.mention if entry.user else "Unknown")
+            break
+    except Exception:
+        pass
+    await send_log(channel.guild, embed)
+
+
+@bot.event
+async def on_guild_channel_delete(channel: discord.abc.GuildChannel) -> None:
+    gdata = store.get_guild(channel.guild.id)
+    now = time.time()
+    while gdata.channel_deletes and now - gdata.channel_deletes[0] > 20:
+        gdata.channel_deletes.popleft()
+    gdata.channel_deletes.append(now)
+
+    embed = discord.Embed(
+        title="📁 Channel Deleted",
+        color=0xED4245,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Channel", value=f"#{channel.name} (`{channel.id}`)")
+    try:
+        async for entry in channel.guild.audit_logs(action=discord.AuditLogAction.channel_delete, limit=1):
+            embed.add_field(name="Deleted by", value=entry.user.mention if entry.user else "Unknown")
+            if isinstance(entry.user, discord.Member) and not is_trusted(entry.user, gdata):
+                if len(gdata.channel_deletes) >= gdata.config["channel_delete_threshold"]:
+                    await punish(entry.user, "Mass channel delete", 10800)
+            break
+    except Exception:
+        pass
+    await send_log(channel.guild, embed)
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role) -> None:
+    embed = discord.Embed(
+        title="🎭 Role Created",
+        color=0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Role", value=f"{role.mention} (`{role.id}`)")
+    embed.add_field(name="Color", value=str(role.color))
+    await send_log(role.guild, embed)
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role) -> None:
+    gdata = store.get_guild(role.guild.id)
+    now = time.time()
+    while gdata.role_deletes and now - gdata.role_deletes[0] > 20:
+        gdata.role_deletes.popleft()
+    gdata.role_deletes.append(now)
+
+    embed = discord.Embed(
+        title="🎭 Role Deleted",
+        color=0xED4245,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Role", value=f"{role.name} (`{role.id}`)")
+    try:
+        async for entry in role.guild.audit_logs(action=discord.AuditLogAction.role_delete, limit=1):
+            embed.add_field(name="Deleted by", value=entry.user.mention if entry.user else "Unknown")
+            if isinstance(entry.user, discord.Member) and not is_trusted(entry.user, gdata):
+                if len(gdata.role_deletes) >= gdata.config["role_delete_threshold"]:
+                    await punish(entry.user, "Mass role delete", 10800)
+            break
+    except Exception:
+        pass
+    await send_log(role.guild, embed)
+
+
+@tasks.loop(minutes=5)
+async def cleanup_task() -> None:
+    now = time.time()
+    for g in store.guilds.values():
+        expired = [uid for uid, t in g.punished.items() if t < now]
+        for uid in expired:
+            del g.punished[uid]
+    store.save()
+
+
+# ──────────────────────────────────────────────────────────────
+# ECONOMY (PESOS)
+# ──────────────────────────────────────────────────────────────
+@tree.command(name="pesos", description="Check your pesos balance")
+@app_commands.describe(member="User to check (optional)")
+async def pesos(interaction: discord.Interaction, member: Optional[discord.Member] = None) -> None:
+    target = member or interaction.user
+    eco = store.get_user(target.id)
+    embed = discord.Embed(title=f"🪙 {target.display_name}'s Pesos", color=0x2B2D31, timestamp=datetime.now(timezone.utc))
+    embed.add_field(name="👛 Wallet", value=f"```{eco.cash:,} ₱```", inline=True)
+    embed.add_field(name="🏦 Bank", value=f"```{eco.bank:,} ₱```", inline=True)
+    embed.add_field(name="💎 Total", value=f"```{eco.cash + eco.bank:,} ₱```", inline=True)
+    embed.set_footer(text="ZeroTrace Economy")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="daily", description="Claim daily pesos")
+async def daily(interaction: discord.Interaction) -> None:
+    eco = store.get_user(interaction.user.id)
+    now = time.time()
+    if now - eco.daily_claimed < 86400:
+        remaining = int(86400 - (now - eco.daily_claimed))
+        await interaction.response.send_message(f"⏳ Come back in **{remaining // 3600}h {(remaining % 3600) // 60}m**", ephemeral=True)
+        return
+    amount = random.randint(DAILY_MIN, DAILY_MAX)
+    eco.cash += amount
+    eco.daily_claimed = now
+    store.save()
+    embed = discord.Embed(title="🎁 Daily Reward", description=f"You received **{amount:,} ₱**", color=0x57F287)
+    embed.add_field(name="👛 New Balance", value=f"**{eco.cash:,} ₱**")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="work", description="Work for pesos")
+async def work(interaction: discord.Interaction) -> None:
+    eco = store.get_user(interaction.user.id)
+    now = time.time()
+    if now - eco.work_claimed < 3600:
+        await interaction.response.send_message(f"⏳ Work again in **{int(3600 - (now - eco.work_claimed)) // 60}m**", ephemeral=True)
+        return
+    amount = random.randint(WORK_MIN, WORK_MAX)
+    eco.cash += amount
+    eco.work_claimed = now
+    store.save()
+    jobs = ["🚚 Delivery Driver", "💻 Software Engineer", "⛏️ Crypto Miner", "🎮 Streamer", "📈 Day Trader", "🔧 Mechanic"]
+    embed = discord.Embed(title="💼 Work Complete", description=f"You worked as a **{random.choice(jobs)}**\nand earned **{amount:,} ₱**", color=0x5865F2)
+    embed.add_field(name="👛 New Balance", value=f"**{eco.cash:,} ₱**")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="deposit", description="Deposit pesos to bank")
+@app_commands.describe(amount="Amount or 'all'")
+async def deposit(interaction: discord.Interaction, amount: str) -> None:
+    eco = store.get_user(interaction.user.id)
+    try:
+        amt = eco.cash if amount.lower() == "all" else int(amount.replace(",", ""))
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid amount", ephemeral=True)
+        return
+    if amt <= 0 or amt > eco.cash:
+        await interaction.response.send_message("❌ Not enough pesos", ephemeral=True)
+        return
+    eco.cash -= amt
+    eco.bank += amt
+    store.save()
+    await interaction.response.send_message(embed=discord.Embed(title="🏦 Deposit Successful", description=f"**{amt:,} ₱** moved to bank", color=0x57F287))
+
+
+@tree.command(name="withdraw", description="Withdraw pesos from bank")
+@app_commands.describe(amount="Amount or 'all'")
+async def withdraw(interaction: discord.Interaction, amount: str) -> None:
+    eco = store.get_user(interaction.user.id)
+    try:
+        amt = eco.bank if amount.lower() == "all" else int(amount.replace(",", ""))
+    except ValueError:
+        await interaction.response.send_message("❌ Invalid amount", ephemeral=True)
+        return
+    if amt <= 0 or amt > eco.bank:
+        await interaction.response.send_message("❌ Not enough in bank", ephemeral=True)
+        return
+    eco.bank -= amt
+    eco.cash += amt
+    store.save()
+    await interaction.response.send_message(embed=discord.Embed(title="👛 Withdrawal Successful", description=f"**{amt:,} ₱** moved to wallet", color=0x57F287))
+
+
+@tree.command(name="pay", description="Pay pesos to another user")
+@app_commands.describe(member="User to pay", amount="Amount")
+async def pay(interaction: discord.Interaction, member: discord.Member, amount: int) -> None:
+    if member.bot or member.id == interaction.user.id or amount <= 0:
+        await interaction.response.send_message("❌ Invalid", ephemeral=True)
+        return
+    eco = store.get_user(interaction.user.id)
+    if eco.cash < amount:
+        await interaction.response.send_message("❌ Not enough pesos", ephemeral=True)
+        return
+    store.get_user(member.id).cash += amount
+    eco.cash -= amount
+    store.save()
+    await interaction.response.send_message(embed=discord.Embed(title="💸 Payment Sent", description=f"You sent **{amount:,} ₱** to {member.mention}", color=0x57F287))
+
+
+@tree.command(name="slots", description="3D Slots")
+@app_commands.describe(bet="Bet amount")
+async def slots(interaction: discord.Interaction, bet: int) -> None:
+    eco = store.get_user(interaction.user.id)
+    if bet <= 0 or bet > eco.cash:
+        await interaction.response.send_message("❌ Invalid bet", ephemeral=True)
+        return
+    eco.cash -= bet
+    symbols = ["🍒", "🍋", "🔔", "⭐", "💎", "7️⃣", "🪙"]
+    result = [random.choice(symbols) for _ in range(3)]
+    display = f"╔══════════╗\n║  {result[0]} │ {result[1]} │ {result[2]}  ║\n╚══════════╝"
+    if result[0] == result[1] == result[2]:
+        mult = 12 if result[0] in ("💎", "7️⃣") else 6
+        win = bet * mult
+        eco.cash += win
+        msg, color = f"🎉 **JACKPOT!** +{win:,} ₱", 0xFEE75C
+    elif len(set(result)) < 3:
+        win = bet * 2
+        eco.cash += win
+        msg, color = f"✨ You won **{win:,} ₱**", 0x57F287
+    else:
+        msg, color = "💨 No match...", 0xED4245
+    store.save()
+    embed = discord.Embed(title="🎰 3D SLOTS", description=f"```\n{display}\n```\n{msg}", color=color)
+    embed.set_footer(text=f"Bet: {bet:,} ₱  •  Balance: {eco.cash:,} ₱")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="coinflip", description="Coin flip")
+@app_commands.describe(bet="Bet amount", choice="heads or tails")
+@app_commands.choices(choice=[
+    app_commands.Choice(name="🟡 Heads", value="heads"),
+    app_commands.Choice(name="⚪ Tails", value="tails"),
+])
+async def coinflip(interaction: discord.Interaction, bet: int, choice: app_commands.Choice[str]) -> None:
+    eco = store.get_user(interaction.user.id)
+    if bet <= 0 or bet > eco.cash:
+        await interaction.response.send_message("❌ Invalid bet", ephemeral=True)
+        return
+    eco.cash -= bet
+    result = random.choice(["heads", "tails"])
+    if choice.value == result:
+        eco.cash += bet * 2
+        msg, color = f"🎉 **{result.upper()}!** +{bet*2:,} ₱", 0x57F287
+    else:
+        msg, color = f"😢 **{result.upper()}** — Lost {bet:,} ₱", 0xED4245
+    store.save()
+    embed = discord.Embed(title="🪙 Coin Flip", description=msg, color=color)
+    embed.set_footer(text=f"Balance: {eco.cash:,} ₱")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="scatter", description="High-risk 3D Scatter")
+@app_commands.describe(bet="Amount to risk")
+async def scatter(interaction: discord.Interaction, bet: int) -> None:
+    eco = store.get_user(interaction.user.id)
+    if bet <= 0 or bet > eco.cash:
+        await interaction.response.send_message("❌ Invalid bet", ephemeral=True)
+        return
+    eco.cash -= bet
+    roll = random.random()
+    if roll < 0.52:
+        mult, msg, color = 0, "💨 The scatter vanished...", 0xED4245
+    elif roll < 0.78:
+        mult, msg, color = 1.8, "✨ Soft scatter hit!", 0x57F287
+    elif roll < 0.93:
+        mult, msg, color = 3.5, "🔥 Strong scatter!", 0xFEE75C
+    else:
+        mult, msg, color = 12, "💥 **MEGA 3D SCATTER!**", 0xEB459E
+    win = int(bet * mult)
+    eco.cash += win
+    store.save()
+    embed = discord.Embed(
+        title="🌀 3D SCATTER",
+        description=f"{msg}\n\n**Bet** → `{bet:,} ₱`\n**Multiplier** → `x{mult}`\n**Won** → `{win:,} ₱`\n**Balance** → `{eco.cash:,} ₱`",
+        color=color,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+# ──────────────────────────────────────────────────────────────
+# SECURITY + MOD COMMANDS
+# ──────────────────────────────────────────────────────────────
+@tree.command(name="help", description="Show help menu")
+async def help_cmd(interaction: discord.Interaction) -> None:
+    data = CATEGORIES["home"]
+    embed = discord.Embed(title=data["title"], description=data["desc"], color=0x2B2D31)
+    if bot.user:
+        embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(
+        name="\u200b",
+        value="[Invite Me](https://discord.com/api/oauth2/authorize?client_id=YOUR_CLIENT_ID&permissions=8&scope=bot%20applications.commands) • [Support Server](https://discord.gg/NdjBB63C8)",
+        inline=False,
+    )
+    await interaction.response.send_message(embed=embed, view=HelpView())
+
+
+@tree.command(name="setup", description="Setup guide")
+@app_commands.default_permissions(administrator=True)
+async def setup(interaction: discord.Interaction) -> None:
+    embed = discord.Embed(
+        title="🛡️ Setup",
+        description="1. `/setlog #channel` ← **Carl-style logs go here**\n2. `/setquarantine @role`\n3. `/setverified @role`\n4. `/verification on`\n5. `/trustrole @Mod`",
+        color=0x2B2D31,
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="setlog", description="Set the Carl-style log channel")
+@app_commands.default_permissions(administrator=True)
+async def setlog(interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+    store.get_guild(interaction.guild_id).config["log_channel_id"] = channel.id
+    store.save()
+    await interaction.response.send_message(f"✅ **Log channel set to {channel.mention}**\nAll joins, leaves, bans, deletes, edits, role changes will appear here.")
+
+
+@tree.command(name="setquarantine", description="Set quarantine role")
+@app_commands.default_permissions(administrator=True)
+async def setquarantine(interaction: discord.Interaction, role: discord.Role) -> None:
+    store.get_guild(interaction.guild_id).config["quarantine_role_id"] = role.id
+    store.save()
+    await interaction.response.send_message(f"✅ Quarantine → {role.mention}")
+
+
+@tree.command(name="setverified", description="Set verified role")
+@app_commands.default_permissions(administrator=True)
+async def setverified(interaction: discord.Interaction, role: discord.Role) -> None:
+    store.get_guild(interaction.guild_id).config["verified_role_id"] = role.id
+    store.save()
+    await interaction.response.send_message(f"✅ Verified → {role.mention}")
+
+
+@tree.command(name="verification", description="Toggle verification")
+@app_commands.default_permissions(administrator=True)
+@app_commands.choices(state=[
+    app_commands.Choice(name="on", value="on"),
+    app_commands.Choice(name="off", value="off"),
+])
+async def verification(interaction: discord.Interaction, state: app_commands.Choice[str]) -> None:
+    enabled = state.value == "on"
+    store.get_guild(interaction.guild_id).config["verification_enabled"] = enabled
+    store.save()
+    await interaction.response.send_message(f"✅ Verification {'ON' if enabled else 'OFF'}")
+
+
+@tree.command(name="verify", description="Verify a member")
+@app_commands.default_permissions(manage_roles=True)
+async def verify(interaction: discord.Interaction, member: discord.Member) -> None:
+    gdata = store.get_guild(interaction.guild_id)
+    if q_id := gdata.config.get("quarantine_role_id"):
+        if role := interaction.guild.get_role(q_id):
+            if role in member.roles:
+                await member.remove_roles(role, reason="Verified")
+    if v_id := gdata.config.get("verified_role_id"):
+        if role := interaction.guild.get_role(v_id):
+            await member.add_roles(role, reason="Verified")
+    await interaction.response.send_message(f"✅ {member.mention} verified")
+
+
+@tree.command(name="whitelist", description="Whitelist management")
+@app_commands.default_permissions(administrator=True)
+@app_commands.choices(action=[
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+])
+async def whitelist(interaction: discord.Interaction, action: app_commands.Choice[str], member: discord.Member) -> None:
+    gdata = store.get_guild(interaction.guild_id)
+    if action.value == "add":
+        gdata.whitelist.add(member.id)
+        await interaction.response.send_message(f"✅ Whitelisted {member.mention}")
+    else:
+        gdata.whitelist.discard(member.id)
+        await interaction.response.send_message(f"✅ Removed {member.mention}")
+    store.save()
+
+
+@tree.command(name="trustrole", description="Trust a role")
+@app_commands.default_permissions(administrator=True)
+async def trustrole(interaction: discord.Interaction, role: discord.Role) -> None:
+    store.get_guild(interaction.guild_id).trusted_roles.add(role.id)
+    store.save()
+    await interaction.response.send_message(f"✅ {role.mention} trusted")
+
+
+@tree.command(name="untrustrole", description="Untrust a role")
+@app_commands.default_permissions(administrator=True)
+async def untrustrole(interaction: discord.Interaction, role: discord.Role) -> None:
+    store.get_guild(interaction.guild_id).trusted_roles.discard(role.id)
+    store.save()
+    await interaction.response.send_message(f"✅ {role.mention} untrusted")
+
+
+@tree.command(name="config", description="View/change thresholds")
+@app_commands.default_permissions(administrator=True)
+async def config_cmd(interaction: discord.Interaction, key: Optional[str] = None, value: Optional[int] = None) -> None:
+    gdata = store.get_guild(interaction.guild_id)
+    if key is None:
+        lines = [f"**{k}**: `{v}`" for k, v in gdata.config.items() if not str(k).endswith("_id")]
+        await interaction.response.send_message(embed=discord.Embed(title="Config", description="\n".join(lines), color=0x2B2D31))
+        return
+    valid = {"join_threshold", "join_window", "ban_threshold", "ban_window", "kick_threshold", "kick_window", "channel_delete_threshold", "role_delete_threshold"}
+    if key.lower() not in valid:
+        await interaction.response.send_message(f"Valid: {', '.join(sorted(valid))}", ephemeral=True)
+        return
+    if value is None:
+        await interaction.response.send_message(f"`{key}` = `{gdata.config.get(key)}`")
+        return
+    gdata.config[key.lower()] = value
+    store.save()
+    await interaction.response.send_message(f"✅ `{key}` → `{value}`")
+
+
+@tree.command(name="status", description="Security status")
+@app_commands.default_permissions(manage_guild=True)
+async def status(interaction: discord.Interaction) -> None:
+    gdata = store.get_guild(interaction.guild_id)
+    embed = discord.Embed(title="🛡️ Status", color=0x2B2D31)
+    embed.add_field(name="Verification", value="ON" if gdata.config.get("verification_enabled") else "OFF")
+    embed.add_field(name="Log Channel", value=f"<#{gdata.config['log_channel_id']}>" if gdata.config.get("log_channel_id") else "Not set")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="purge", description="Delete messages")
+@app_commands.default_permissions(manage_messages=True)
+async def purge(interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100]) -> None:
+    await interaction.response.defer(ephemeral=True)
+    deleted = await interaction.channel.purge(limit=amount)
+    await interaction.followup.send(f"🗑️ Deleted **{len(deleted)}** messages", ephemeral=True)
+
+
+@tree.command(name="slowmode", description="Set slowmode")
+@app_commands.default_permissions(manage_channels=True)
+async def slowmode(interaction: discord.Interaction, seconds: app_commands.Range[int, 0, 21600]) -> None:
+    await interaction.channel.edit(slowmode_delay=seconds)
+    await interaction.response.send_message(f"⏱️ Slowmode → **{seconds}s**")
+
+
+# ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    if TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("Set DISCORD_TOKEN")
+        raise SystemExit(1)
+    bot.run(TOKEN, log_handler=None)
